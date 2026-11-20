@@ -26,8 +26,24 @@ services:
       DATABASE_URL: postgresql://appuser:apppass@db:5432/devicedb
       VACUUM_STATEMENT_TIMEOUT_MS: "0"
       SYNC_WAIT_SECONDS: "30"
+      LOG_QUEUE_SIZE: "5000"
+      LOG_BATCH_SIZE: "500"
+      LOG_FLUSH_INTERVAL_MS: "250"
+      SHUTDOWN_GRACE_SECONDS: "15"
     ports:
       - "8000:8000"
+    # 关停时给在跑的作业留出取消 + 落库“未确认”状态的时间
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request; urllib.request.urlopen(
+          'http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

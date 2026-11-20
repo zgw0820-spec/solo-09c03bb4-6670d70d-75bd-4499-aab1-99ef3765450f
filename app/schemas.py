@@ -132,6 +132,100 @@ class StatsSnapshot(BaseModel):
     total_relation_size_bytes: int
 
 
+LogState = Literal["collecting", "complete", "incomplete"]
+
+
+class JobLogSummary(BaseModel):
+    """作业行上的日志摘要字段；列表与详情只暴露这些，不暴露日志明细。"""
+
+    state: LogState = Field(
+        ...,
+        description=(
+            "collecting: 作业运行中，日志仍在采集；"
+            "complete: 作业已结束且日志已全部收齐；"
+            "incomplete: 作业中断或日志写入失败/有丢弃，已保存部分仍可读"
+        ),
+    )
+    entries_saved: int = Field(..., description="已持久化的日志条数（不含丢弃）")
+    entries_dropped: int = Field(0, description="因队列满或写库失败而丢弃的条数")
+    error: str | None = Field(None, description="日志采集/写入的问题说明")
+
+
+class JobResult(BaseModel):
+    """VACUUM 结果摘要；不含日志明细（日志走分页入口）。
+
+    旧版本作业可能只有 duration_ms 等部分字段，因此除 duration_ms 外均可缺省。
+    """
+
+    duration_ms: float | None = None
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = Field(
+        None, description="VACUUM 后回读的统计（估值）；回读失败时为 null"
+    )
+    disk_notice: str | None = None
+    completed_at: datetime | None = None
+    stats_error: str | None = Field(
+        None, description="VACUUM 已成功但回读统计失败时的原因；不改变成败结论"
+    )
+
+
+class JobSummary(BaseModel):
+    """列表用摘要：状态、时间、统计结果，不含 result 整包与日志明细。"""
+
+    id: int
+    table_schema: str
+    table_name: str
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    started_at: datetime
+    finished_at: datetime | None = None
+    statement_timeout_ms: int
+    error_message: str | None = None
+    after_stats: dict[str, Any] | None = Field(
+        None, description="VACUUM 后回读的统计摘要（估值），仅成功作业有值"
+    )
+    logs: JobLogSummary
+    log_url: str = Field(..., description="日志分页入口（GET，按游标续读）")
+
+
+class JobListResponse(BaseModel):
+    """作业列表：只含摘要字段，不含 result 整包与日志明细。"""
+
+    jobs: list["JobSummary"]
+
+
+class JobLogEntry(BaseModel):
+    seq: int = Field(..., description="游标；下一页把它作为 after_seq 回传")
+    logged_at: datetime
+    severity: str
+    message: str
+
+
+class JobLogPage(BaseModel):
+    job_id: int
+    job_status: Literal["running", "succeeded", "failed", "interrupted"] = Field(
+        ..., description="作业本身的执行状态；与日志采集状态分开呈现"
+    )
+    items: list[JobLogEntry]
+    next_seq: int = Field(
+        ..., description="下一页的 after_seq；没有更多时等于最后一条的 seq"
+    )
+    has_more: bool
+    state: LogState = Field(..., description="当前末尾的日志采集状态")
+    entries_saved: int
+    entries_dropped: int = 0
+    end_reason: str = Field(
+        ...,
+        description=(
+            "本页之后是否还有内容：has_more=true 时阅读方式不变；"
+            "has_more=false 时给出结论 —— "
+            "collecting=作业仍在采集，稍后用同一 next_seq 续读；"
+            "complete=日志已收齐；"
+            "incomplete=采集不完整（作业中断或写入失败/丢弃），已保存部分保留"
+        ),
+    )
+    error: str | None = None
+
+
 class JobResponse(BaseModel):
     id: int
     table_schema: str
@@ -141,8 +235,13 @@ class JobResponse(BaseModel):
     finished_at: datetime | None = None
     statement_timeout_ms: int
     before_snapshot: dict[str, Any]
-    result: dict[str, Any] | None = None
+    result: JobResult | None = Field(
+        None,
+        description="VACUUM 结果（不含日志明细；VERBOSE 日志请走 log_url 分页读取）",
+    )
     error_message: str | None = None
+    logs: JobLogSummary
+    log_url: str = Field(..., description="日志分页入口（GET，按游标续读）")
     verification_hint: str | None = Field(
         None,
         description="interrupted 作业的核实结论: 重启后对比统计基线判断 VACUUM 是否实际完成",

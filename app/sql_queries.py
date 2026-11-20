@@ -52,6 +52,149 @@ CREATE_JOB_UNIQUE = sql.SQL(
     tbl=_q(settings.job_table),
 )
 
+# 日志采集/落库状态直接挂在作业行上，列表与详情只读这些摘要字段，
+# 不需要扫日志明细表。
+#   collecting  作业运行中，日志仍在采集
+#   complete    作业已结束且日志已全部收齐
+#   incomplete  作业中断，或写入失败/有丢弃，已保存的部分保留
+ALTER_JOB_LOG_COLUMNS = [
+    sql.SQL(
+        "ALTER TABLE {sch}.{tbl} ADD COLUMN IF NOT EXISTS "
+        "log_state text NOT NULL DEFAULT 'collecting'"
+    ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table)),
+    sql.SQL(
+        "ALTER TABLE {sch}.{tbl} ADD COLUMN IF NOT EXISTS "
+        "log_entries bigint NOT NULL DEFAULT 0"
+    ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table)),
+    sql.SQL(
+        "ALTER TABLE {sch}.{tbl} ADD COLUMN IF NOT EXISTS "
+        "log_dropped bigint NOT NULL DEFAULT 0"
+    ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table)),
+    sql.SQL(
+        "ALTER TABLE {sch}.{tbl} ADD COLUMN IF NOT EXISTS log_error text"
+    ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table)),
+]
+
+# 逐条持久化的 VACUUM VERBOSE 日志。(job_id, seq) 主键同时是游标分页索引，
+# seq 由采集端单调递增分配；ON CONFLICT 保证重放/重试幂等。
+CREATE_LOG_TABLE = sql.SQL(
+    """
+    CREATE TABLE IF NOT EXISTS {sch}.{log} (
+        job_id    bigint      NOT NULL,
+        seq       bigint      NOT NULL,
+        logged_at timestamptz NOT NULL DEFAULT now(),
+        severity  text        NOT NULL,
+        message   text        NOT NULL,
+        PRIMARY KEY (job_id, seq)
+    )
+    """
+).format(sch=_q(settings.job_schema), log=_q(settings.log_table))
+
+INSERT_LOG_ENTRY = sql.SQL(
+    """
+    INSERT INTO {sch}.{log} (job_id, seq, logged_at, severity, message)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (job_id, seq) DO NOTHING
+    """
+).format(sch=_q(settings.job_schema), log=_q(settings.log_table))
+
+# 进度用“累计值覆盖”而不是自增：批写入若提交成功但响应丢失会重试，
+# ON CONFLICT DO NOTHING 保证行不重复，累计值覆盖保证计数也不重复。
+UPDATE_JOB_LOG_PROGRESS = sql.SQL(
+    """
+    UPDATE {sch}.{tbl}
+       SET log_entries = %s, log_dropped = %s, log_error = %s
+     WHERE id = %s AND status = 'running'
+    """
+).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
+
+READ_LOG_PAGE = sql.SQL(
+    """
+    SELECT seq, logged_at, severity, message
+      FROM {sch}.{log}
+     WHERE job_id = %s AND seq > %s
+     ORDER BY seq
+     LIMIT %s
+    """
+).format(sch=_q(settings.job_schema), log=_q(settings.log_table))
+
+# 旧版本把 VERBOSE 通知整段塞在 result->'vacuum_verbose_notices' 里。
+# 启动时把它们搬进日志明细表，使旧作业也能从同一分页入口读取。
+MIGRATE_LEGACY_NOTICES = sql.SQL(
+    """
+    INSERT INTO {sch}.{log} (job_id, seq, severity, message)
+    SELECT j.id,
+           s.ord,
+           CASE WHEN s.elem ~ '^(INFO|WARNING|NOTICE|ERROR|LOG|DEBUG): '
+                THEN split_part(s.elem, ': ', 1)
+                ELSE 'INFO' END,
+           regexp_replace(
+               s.elem, '^(INFO|WARNING|NOTICE|ERROR|LOG|DEBUG): ', '')
+      FROM {sch}.{tbl} j
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+               CASE WHEN jsonb_typeof(j.result->'vacuum_verbose_notices')
+                         = 'array'
+                    THEN j.result->'vacuum_verbose_notices'
+                    ELSE '[]'::jsonb END) WITH ORDINALITY
+               AS s(elem, ord)
+     WHERE j.result IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM {sch}.{log} l WHERE l.job_id = j.id)
+    ON CONFLICT (job_id, seq) DO NOTHING
+    """
+).format(
+    sch=_q(settings.job_schema),
+    tbl=_q(settings.job_table),
+    log=_q(settings.log_table),
+)
+
+RECOUNT_JOB_LOG_ENTRIES = sql.SQL(
+    """
+    UPDATE {sch}.{tbl} j
+       SET log_entries = c.n
+      FROM (SELECT job_id, count(*) AS n
+              FROM {sch}.{log} GROUP BY job_id) c
+     WHERE c.job_id = j.id
+       AND j.log_entries <> c.n
+    """
+).format(
+    sch=_q(settings.job_schema),
+    tbl=_q(settings.job_table),
+    log=_q(settings.log_table),
+)
+
+# 旧版本作业没有 log_state（默认 collecting）。进程在旧版本里已结束时，
+# 其 VERBOSE 通知要么已随 result 完整落库（已迁移），要么作业是 interrupted。
+# 只处理已结束的作业；运行中的作业由启动扫描先改成 interrupted。
+NORMALIZE_LEGACY_LOG_STATE = sql.SQL(
+    """
+    UPDATE {sch}.{tbl}
+       SET log_state = CASE WHEN status = 'interrupted'
+                            THEN 'incomplete' ELSE 'complete' END,
+           log_error  = CASE WHEN status = 'interrupted'
+                             THEN COALESCE(log_error,
+                                  '作业在服务重启时被标记为 interrupted，'
+                                  '日志可能未收齐')
+                             ELSE log_error END
+     WHERE log_state = 'collecting'
+       AND status IN ('succeeded', 'failed', 'interrupted')
+    """
+).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
+
+# 列表只取状态/统计摘要，不取 result 整包，更不取日志明细。
+# after_stats 是从 result 中抽出的小对象（before/after 统计），供值班员概览。
+LIST_JOB_SUMMARIES = sql.SQL(
+    """
+    SELECT id, table_schema, table_name, status, started_at, finished_at,
+           statement_timeout_ms, error_message,
+           log_state, log_entries, log_dropped, log_error,
+           result->'after' AS after_stats
+      FROM {sch}.{tbl}
+     WHERE table_schema = %s AND table_name = %s
+     ORDER BY id DESC
+     LIMIT %s
+    """
+).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
+
 CREATE_AUDIT_TABLE = sql.SQL(
     """
     CREATE TABLE IF NOT EXISTS {sch}.{tbl} (
@@ -68,13 +211,17 @@ CREATE_AUDIT_TABLE = sql.SQL(
     """
 ).format(sch=_q(settings.job_schema), tbl=_q(settings.audit_table))
 
-# 服务重启/崩溃恢复: 把没有结局的作业标为 interrupted
+# 服务重启/崩溃恢复: 把没有结局的作业标为 interrupted。
+# 同时把日志状态改成 incomplete —— 已落库的日志一条不删，游标仍可续读。
 SWEEP_INTERRUPTED = sql.SQL(
     """
     UPDATE {sch}.{tbl}
        SET status = 'interrupted',
            finished_at = now(),
-           error_message = '进程退出或服务重启，VACUUM 结果未经确认；可凭此作业核实或重试'
+           error_message = '进程退出或服务重启，VACUUM 结果未经确认；可凭此作业核实或重试',
+           log_state = 'incomplete',
+           log_error = COALESCE(log_error,
+                                '进程退出或服务重启，日志未收齐；已保存部分保留')
      WHERE status = 'running'
     """
 ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
@@ -91,7 +238,20 @@ INSERT_JOB = sql.SQL(
 FINISH_JOB = sql.SQL(
     """
     UPDATE {sch}.{tbl}
-       SET status = %s, finished_at = now(), result = %s, error_message = %s
+       SET status = %s, finished_at = now(), result = %s, error_message = %s,
+           log_entries = %s, log_state = %s, log_dropped = %s, log_error = %s
+     WHERE id = %s AND status = 'running'
+    RETURNING id
+    """
+).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
+
+# 服务关停等主动取消: 只落“未确认完成”，不碰已有日志
+MARK_INTERRUPTED = sql.SQL(
+    """
+    UPDATE {sch}.{tbl}
+       SET status = 'interrupted', finished_at = now(),
+           error_message = %s, log_entries = %s,
+           log_state = 'incomplete', log_dropped = %s, log_error = %s
      WHERE id = %s AND status = 'running'
     RETURNING id
     """
@@ -101,11 +261,19 @@ GET_JOB = sql.SQL(
     "SELECT * FROM {sch}.{tbl} WHERE id = %s"
 ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
 
-LIST_JOBS = sql.SQL(
+# 单作业摘要（详情接口用）：不带日志明细，日志从分页入口读。
+GET_JOB_SUMMARY = sql.SQL(
     """
-    SELECT * FROM {sch}.{tbl}
-     WHERE table_schema = %s AND table_name = %s
-     ORDER BY id DESC LIMIT %s
+    SELECT j.id, j.table_schema, j.table_name, j.status,
+           j.started_at, j.finished_at, j.statement_timeout_ms,
+           j.before_snapshot,
+           -- 详情只保留结果摘要：剔除旧版本内嵌的日志明细
+           CASE WHEN j.result IS NULL THEN NULL
+                ELSE j.result - 'vacuum_verbose_notices' END AS result,
+           j.error_message,
+           j.log_state, j.log_entries, j.log_dropped, j.log_error
+      FROM {sch}.{tbl} j
+     WHERE j.id = %s
     """
 ).format(sch=_q(settings.job_schema), tbl=_q(settings.job_table))
 
@@ -128,6 +296,7 @@ TABLE_STATS = sql.SQL(
            n.nspname AS table_schema,
            c.relname AS table_name,
            c.oid::regclass::text AS relation,
+           c.relkind::text AS relkind,
            pg_stat_get_dead_tuples(c.oid)  AS n_dead_tup_estimate,
            pg_stat_get_live_tuples(c.oid)  AS n_live_tup_estimate,
            pg_stat_get_vacuum_count(c.oid) AS vacuum_count,
@@ -147,6 +316,46 @@ TABLE_STATS = sql.SQL(
       LEFT JOIN pg_stat_user_tables stat
              ON stat.relid = c.oid
      WHERE n.nspname = %s AND c.relname = %s
+    """
+)
+
+# 分区表的统计按叶子分区汇总。PG16 中父表（relkind='p'）没有存储，
+# pg_stat_get_* 与 pg_relation_size 恒为 0；只看父表会把“已执行”误判为“没执行”。
+TABLE_TREE_STATS = sql.SQL(
+    """
+    WITH leaves AS (
+        SELECT relid
+          FROM pg_partition_tree(%s::regclass)
+         WHERE isleaf
+    )
+    SELECT current_database() AS db_name,
+           %s AS table_schema,
+           %s AS table_name,
+           %s::regclass::text AS relation,
+           'p' AS relkind,
+           coalesce(sum(pg_stat_get_dead_tuples(l.relid)), 0)::bigint
+               AS n_dead_tup_estimate,
+           coalesce(sum(pg_stat_get_live_tuples(l.relid)), 0)::bigint
+               AS n_live_tup_estimate,
+           coalesce(sum(pg_stat_get_vacuum_count(l.relid)), 0)::bigint
+               AS vacuum_count,
+           coalesce(sum(pg_stat_get_autovacuum_count(l.relid)), 0)::bigint
+               AS autovacuum_count,
+           max(stat.last_vacuum)       AS last_vacuum,
+           max(stat.last_autovacuum)   AS last_autovacuum,
+           coalesce(sum(pg_relation_size(l.relid)), 0)::bigint
+               AS relation_size_bytes,
+           coalesce(sum(pg_total_relation_size(l.relid)), 0)::bigint
+               AS total_relation_size_bytes,
+           GREATEST(coalesce(sum(pg_stat_get_dead_tuples(l.relid)), 0), 0)
+               / NULLIF(coalesce(sum(pg_stat_get_live_tuples(l.relid)), 0)
+                        + coalesce(sum(pg_stat_get_dead_tuples(l.relid)), 0), 0)
+               AS dead_tuple_ratio_estimate,
+           max(stat.last_analyze)      AS last_analyze,
+           max(stat.last_autoanalyze)  AS last_autoanalyze,
+           count(*)::int               AS partition_count
+      FROM leaves l
+      LEFT JOIN pg_stat_user_tables stat ON stat.relid = l.relid
     """
 )
 
@@ -200,8 +409,6 @@ REPLICATION_SLOTS = sql.SQL(
      ORDER BY slot_name
     """
 )
-
-# --- 会话终止前的再校验 ------------------------------------------------------
 
 # 只能结束: 同库 + PID + backend_start + xact_start 全部吻合 +
 # 仍是 idle in transaction 的原会话，任一变化即拒绝。

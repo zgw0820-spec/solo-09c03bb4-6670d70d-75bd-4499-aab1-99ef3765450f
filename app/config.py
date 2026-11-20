@@ -20,6 +20,17 @@ class Settings:
     job_schema: str = os.environ.get("MAINT_SCHEMA", "maintenance")
     job_table: str = os.environ.get("MAINT_JOB_TABLE", "vacuum_jobs")
     audit_table: str = os.environ.get("MAINT_AUDIT_TABLE", "termination_audit")
+    # VACUUM VERBOSE 日志逐条落库的目标表
+    log_table: str = os.environ.get("MAINT_LOG_TABLE", "vacuum_job_logs")
+    # 日志采集的有界缓冲：队列最多容纳多少条、每批最多写多少条、
+    # 空闲多久强制刷盘（毫秒）。内存占用由这三个值决定，与日志累计条数无关。
+    log_queue_size: int = _int("LOG_QUEUE_SIZE", 5000)
+    log_batch_size: int = _int("LOG_BATCH_SIZE", 500)
+    log_flush_interval_ms: int = _int("LOG_FLUSH_INTERVAL_MS", 250)
+    # 关闭日志写入器时等待线程排空/刷盘的最长秒数
+    log_close_timeout_seconds: int = _int("LOG_CLOSE_TIMEOUT_SECONDS", 10)
+    # 服务关停时等待后台作业收尾（落库“未确认”状态）的最长秒数
+    shutdown_grace_seconds: int = _int("SHUTDOWN_GRACE_SECONDS", 15)
     # 连接池容量
     pool_min_size: int = _int("POOL_MIN_SIZE", 1)
     pool_max_size: int = _int("POOL_MAX_SIZE", 10)

@@ -1,6 +1,8 @@
 """会话终止（带再校验）与 VACUUM 后台作业执行器。"""
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,6 +13,9 @@ from psycopg.types.json import Jsonb
 
 from . import db, sql_queries as q
 from .config import settings
+from .job_logs import CollectorStats, VacuumLogCollector
+
+_joblog = logging.getLogger("app.maintenance")
 
 DISK_NOTICE = (
     "relation_size_bytes 是当前磁盘占用，前后差值不等于且不可称为"
@@ -147,22 +152,30 @@ async def run_vacuum_job(
         阶段即被拒（409），不会走到这里；
       第二道（会话级）: 按表派生 key 的阻塞式 pg_advisory_lock，
         进程崩溃/重启时会话锁由 PostgreSQL 自动释放。
+
+    日志: VERBOSE 通知不攒在内存里，逐条交给 VacuumLogCollector，
+    由它用独立连接分批落库；作业运行中即可按游标读取。
+    作业成功与否只以 VACUUM 语句是否真正返回为准。
     """
     started = datetime.now(timezone.utc)
-    notices: list[str] = []
+    collector = VacuumLogCollector(job_id)
+    collector.start()
 
-    def notice_handler(notice):  # psycopg3: 单参数 Notice
-        notices.append(f"{notice.severity}: {notice.message_primary}")
+    logger = _joblog.getChild(f"job-{job_id}")
+    logger.info("VACUUM 作业开始: %s.%s", schema_name, table_name)
 
+    lock_key = _advisory_lock_key(schema_name, table_name)
+    vacuum_ok = False
+    cancelled = False
+    vacuum_error: str | None = None
     try:
         async with await psycopg.AsyncConnection.connect(
             settings.database_url,
             autocommit=True,
             row_factory=dict_row,
         ) as conn:
-            conn.add_notice_handler(notice_handler)
+            conn.add_notice_handler(collector.handle_notice)
 
-            lock_key = _advisory_lock_key(schema_name, table_name)
             # 阻塞式会话锁: 部分唯一索引已保证同表不会有第二个 running 作业，
             # 这里是跨进程的第二道互斥保险。进程退出时会话锁自动释放。
             await conn.execute(
@@ -180,26 +193,109 @@ async def run_vacuum_job(
                     sch=sql.Identifier(schema_name),
                     tbl=sql.Identifier(table_name),
                 )
+                # 只有这条语句真正返回，vacuum_ok 才为真
                 await conn.execute(vacuum)
+                vacuum_ok = True
+            except asyncio.CancelledError:
+                # 服务关停时任务被取消：VACUUM 结果未经确认
+                cancelled = True
+                vacuum_error = "服务关停，VACUUM 结果未经确认"
+                raise
+            except Exception as exc:
+                vacuum_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("VACUUM 语句失败: %s", vacuum_error)
             finally:
-                await conn.execute(
-                    "SELECT pg_advisory_unlock(%s)", (lock_key,)
-                )
+                try:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock(%s)", (lock_key,)
+                    )
+                except Exception as exc:
+                    logger.warning("释放 advisory lock 失败: %s", exc)
 
-            after_row = await db.fetch_table_stats(schema_name, table_name)
-        after = db.stats_snapshot(after_row)
-        finished = datetime.now(timezone.utc)
-        result = {
-            "duration_ms": round((finished - started).total_seconds() * 1000, 3),
-            "before": await _get_before_snapshot(job_id),
-            "after": after,
-            "vacuum_verbose_notices": notices,
-            "disk_notice": DISK_NOTICE,
-            "completed_at": finished.isoformat(),
-        }
-        await _finish(job_id, "succeeded", result, None)
-    except Exception as exc:  # 失败也要落库，绝不静默
-        await _finish(job_id, "failed", None, f"{type(exc).__name__}: {exc}")
+        if vacuum_ok:
+            # 成败只由 VACUUM 语句是否返回决定；回读统计失败不改变结论，
+            # 只把失败原因附在结果里。
+            after: dict[str, Any] | None = None
+            stats_error: str | None = None
+            try:
+                after_row = await db.fetch_table_stats(schema_name, table_name)
+                after = db.stats_snapshot(after_row)
+            except Exception as exc:
+                stats_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("VACUUM 已成功，但回读统计失败: %s", stats_error)
+            finished = datetime.now(timezone.utc)
+            try:
+                before = await _get_before_snapshot(job_id)
+            except Exception as exc:  # 基线缺失不影响“VACUUM 已执行”的结论
+                before = None
+                logger.warning("VACUUM 已成功，但读取统计基线失败: %s", exc)
+            result = {
+                "duration_ms": round((finished - started).total_seconds() * 1000, 3),
+                "before": before,
+                "after": after,
+                "disk_notice": DISK_NOTICE,
+                "completed_at": finished.isoformat(),
+                "stats_error": stats_error,
+            }
+        else:
+            result = None
+    except asyncio.CancelledError:
+        # 取消发生在连接建立/等锁等阶段：同样按“未确认”处理
+        cancelled = True
+        vacuum_error = vacuum_error or "服务关停，VACUUM 结果未经确认"
+        result = None
+    except Exception as exc:  # 连接失败等：同样要落库，绝不静默
+        vacuum_error = f"{type(exc).__name__}: {exc}"
+        result = None
+    finally:
+        stats = collector.close()
+        if cancelled:
+            # 主动取消：不改写为 succeeded/failed，保留“未确认”语义。
+            # 用独立连接落库，避免连接池已关或再次取消导致状态丢失；
+            # 服务重启后仍可由启动扫描兜底标记 interrupted。
+            try:
+                await asyncio.shield(
+                    _mark_interrupted(job_id, vacuum_error, stats)
+                )
+            except Exception as exc:
+                logger.error("取消后落库 interrupted 失败（将由重启扫描兜底）: %s", exc)
+        elif vacuum_ok:
+            await _finish(
+                job_id, "succeeded", result, None,
+                log_state=stats.log_state, log_entries=stats.persisted,
+                log_dropped=stats.dropped, log_error=stats.error_text(),
+            )
+        else:
+            await _finish(
+                job_id, "failed", None,
+                vacuum_error or "VACUUM 未成功返回",
+                log_state=stats.log_state, log_entries=stats.persisted,
+                log_dropped=stats.dropped, log_error=stats.error_text(),
+            )
+        logger.info(
+            "VACUUM 作业结束: ok=%s cancelled=%s 日志已保存=%s 丢弃=%s 状态=%s",
+            vacuum_ok, cancelled, stats.persisted, stats.dropped,
+            stats.log_state,
+        )
+
+
+async def _mark_interrupted(
+    job_id: int, error: str | None, stats: CollectorStats
+) -> None:
+    """服务关停导致的取消：作业标 interrupted，日志标 incomplete（已保存保留）。
+
+    用独立的 autocommit 连接，不依赖连接池——关停时连接池可能已关闭。
+    """
+    async with await psycopg.AsyncConnection.connect(
+        settings.database_url, autocommit=True
+    ) as conn:
+        await conn.execute(
+            q.MARK_INTERRUPTED,
+            (error or "服务关停，VACUUM 结果未经确认；可重试",
+             stats.persisted, stats.dropped,
+             stats.error_text() or "服务关停，日志可能未收齐",
+             job_id),
+        )
 
 
 async def _get_before_snapshot(job_id: int) -> dict[str, Any]:
@@ -211,7 +307,15 @@ async def _get_before_snapshot(job_id: int) -> dict[str, Any]:
 
 
 async def _finish(
-    job_id: int, status: str, result: dict[str, Any] | None, error: str | None
+    job_id: int,
+    status: str,
+    result: dict[str, Any] | None,
+    error: str | None,
+    *,
+    log_state: str = "complete",
+    log_entries: int = 0,
+    log_dropped: int = 0,
+    log_error: str | None = None,
 ) -> None:
     pool = await db.open_pool()
     async with pool.connection() as conn:
@@ -219,7 +323,9 @@ async def _finish(
             q.FINISH_JOB,
             (status,
              Jsonb(db.to_jsonable(result)) if result is not None else None,
-             error, job_id),
+             error,
+             log_entries, log_state, log_dropped, log_error,
+             job_id),
         )
 
 
